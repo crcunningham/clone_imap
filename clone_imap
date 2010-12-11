@@ -1,0 +1,336 @@
+#!/usr/bin/env ruby
+
+# Modified version of: http://wonko.com/post/ruby_script_to_sync_email_from_any_imap_server_to_gmail 
+# You will need get the 'getopt' gem to run this script
+# Only ever tested on OS X
+
+# XXX: There is a bug, where IMAP folders with names including '_' chars will not be created
+
+require 'net/imap'
+require 'fileutils'
+require 'rubygems'
+require 'getopt/long'
+
+# Do some options parsing
+opt = Getopt::Long.getopts(
+["--config", "-c", Getopt::REQUIRED],
+["--local", "-l", Getopt::REQUIRED],
+["--localonly", "-o", Getopt::BOOLEAN],
+["--help", "-h", Getopt::BOOLEAN],
+["--example", "-e", Getopt::BOOLEAN]
+)
+ 
+if(opt["help"])
+	puts "Required:
+	\'--config | -c\' <config file>, this is required
+Optional:
+	\'--local | -l\' <dir>, will create a local copy of your mailbox at <dir> (in a format that apple mail can open)
+	\'--localonly | -o\', will create only a local copy of your mailbox, note you must specify --local as well
+Extras:
+	\'--help | -h\', displays this help
+	\'--example | -e\' will display an example configuration file"
+	exit
+end
+
+if(opt["example"])
+
+	puts "# Source server connection info.
+SOURCE_NAME = you@host.com
+SOURCE_HOST = host.com
+SOURCE_PORT = 993
+SOURCE_SSL  = true
+SOURCE_USER = you
+SOURCE_PASS = your_password
+
+# Destination server connection info.
+DEST_NAME = other_you@otherhost.com
+DEST_HOST = otherhost.com
+DEST_PORT = 993
+DEST_SSL  = true
+DEST_USER = other_you
+DEST_PASS = your_other_password"
+	exit
+end
+
+
+if(!opt["config"])
+	puts "You need to specify a config file"
+	exit
+else
+	config = opt["config"];	
+	if(!File.exists?(config))
+		puts "That file doesn't exist"
+		exit 
+	end	
+end
+
+if(opt["local"])
+	outputdir = opt["local"]
+	puts "A local copy of the all the mail will be saved to \'#{outputdir}\'"
+end	
+
+if(opt["localonly"] and opt["local"])
+	puts "No server copying will be performed"
+end
+
+if(opt["localonly"] and !opt["local"])
+	puts "You have localonly but no local, plsfix"
+	exit
+end
+
+
+# Read a config file
+$configHash = Hash.new
+file = File.open(config, 'r') 
+
+while( line = file.gets )
+	
+	line = line.chomp
+	
+	# Skip empty lines and commented lines
+	if(line.eql?("") || line.match(/^#/))
+		next
+	end
+	
+	# Remove white space and split on an equal sign
+	line = line.gsub(" ", "")
+	parts = line.split('=')
+	
+	# Add the value to the hash
+	$configHash["#{parts[0]}"] = parts[1];
+end
+
+# Validate the config hash
+requiredKeys = Hash.new
+
+if(opt["localonly"]) 
+	requiredKeys = [ "SOURCE_NAME", "SOURCE_USER", "SOURCE_PASS", "SOURCE_HOST", "SOURCE_PORT", "SOURCE_SSL" ];
+
+else
+	requiredKeys = [ "SOURCE_NAME", "SOURCE_USER", "SOURCE_PASS", "SOURCE_HOST", "SOURCE_PORT", "SOURCE_SSL",
+					"DEST_NAME", "DEST_USER", "DEST_PASS", "DEST_HOST", "DEST_PORT", "DEST_SSL" ];
+end
+
+
+			
+requiredKeys.each do  |key|
+	if(!$configHash.has_key?(key))
+		puts "Missing configuration key #{key}"
+		exit		
+	end
+end
+
+# mkdir with a check
+def mkdir_ifnot_exists(path)  
+	if(!(File.directory? path))
+		FileUtils.mkdir_p path;
+	end
+end
+
+# Maximum number of messages to select at once.
+UID_BLOCK_SIZE = 1024
+
+# Utility methods.
+def dd(message)
+	the_dest = $configHash["DEST_NAME"];
+	puts "[#{the_dest} #{message}"
+end
+
+
+def ds(message)
+	the_src = $configHash["SOURCE_NAME"];
+	puts "[#{the_src}] #{message}"
+end
+
+def uid_fetch_block(server, uids, *args)
+	pos = 0
+
+	while pos < uids.size
+		server.uid_fetch(uids[pos, UID_BLOCK_SIZE], *args).each {|data| yield data }
+		pos += UID_BLOCK_SIZE
+	end
+end
+
+# Begin the real work
+
+@failures = 0
+@existing = 0
+@synced   = 0
+
+# Connect and log into both servers.
+ds 'Connecting...'
+source = Net::IMAP.new($configHash["SOURCE_HOST"], $configHash["SOURCE_PORT"], $configHash["SOURCE_SSL"])
+
+ds 'Logging in...'
+source.login($configHash["SOURCE_USER"], $configHash["SOURCE_PASS"])
+
+if(!opt["localonly"])
+	dd 'Connecting...'
+	dest = Net::IMAP.new($configHash["DEST_HOST"], $configHash["DEST_PORT"], $configHash["DEST_SSL"])
+
+	dd 'Logging in...'
+	dest.login($configHash["DEST_USER"], $configHash["DEST_PASS"])
+end
+
+# All of the folders in your imap account
+sub_folder_list = source.list("", "*");
+
+# Loop through folders and copy messages.
+sub_folder_list.each do |folder|
+
+	if(opt["local"])
+		# Make the local folder
+		ds "Making local dir #{outputdir}/#{folder.name}"
+		mkdir_ifnot_exists("#{outputdir}/#{folder.name}")
+	end
+
+	# Open source folder in read-only mode.
+	begin
+		ds "Selecting folder #{folder.name}..."
+		source.select(folder.name)
+
+	rescue => e
+		ds "Error: select failed: #{e}"
+		next
+	end
+
+	if(!opt["localonly"])
+		# Open (or create) destination folder in read-write mode.
+		begin
+			dd "Selecting folder '#{folder.name}'..."
+			dest.select(folder.name)
+		rescue => e
+
+			begin
+				dd "Folder not found; creating..."
+				dest.create(folder.name)
+				dest.select(folder.name)
+			rescue => ee
+				dd "Error: could not create folder: #{e}"
+				next
+			end
+		end
+
+		# Build a lookup hash of all message ids present in the destination folder.
+		dest_info = {}
+
+		dd 'Analyzing existing messages...'
+		uids = dest.uid_search(['ALL'])
+
+		if uids.length > 0
+			uid_fetch_block(dest, uids, ['ENVELOPE']) do |data|
+				dest_info[data.attr['ENVELOPE'].message_id] = true
+			end
+		end
+		dd "Found #{uids.length} messages"
+	end
+
+	# Loop through all messages in the source folder.
+	uids = source.uid_search(['ALL'])
+
+	ds "Found #{uids.length} messages"
+
+	if uids.length > 0
+		uid_fetch_block(source, uids, ['ENVELOPE']) do |data|
+			mid = data.attr['ENVELOPE'].message_id
+			
+			## There are three possible situations for this messaage downloading: 
+			#	1. Server-to-Server
+			#	2. Server-to-Server + Local Copy
+			#	3. Local Copy only
+			# To be smart about downloading we have the following 3 if's
+			
+			# Case (1.)
+			# Check if the file is already on the destination server, if so, skip it
+			if(!opt["local"])
+				if dest_info[mid]
+					@existing += 1
+					next
+				end
+			end
+
+			# Case (2.)
+			# If we are doing both a local and server copy and the file exists in both places, skip it
+			# can't do this if localonly, since we have no dest_info[] array
+			if(opt["local"] && !opt["localonly"])
+				if(FileTest.exists?("#{outputdir}/#{folder.name}/#{mid}.emlx") && dest_info[mid] )
+					@existing += 1
+				end
+			end
+
+			# Case (3.)
+			# If we are doing a local only and they file is already in place, skip it
+			if(opt["localonly"])
+				if(FileTest.exists?("#{outputdir}/#{folder.name}/#{mid}.emlx"))
+					@existing += 1
+					next
+				end
+			end
+			
+			
+			# Download the full message body from the source folder.
+			ds "Downloading message #{mid}..."
+			msg = source.uid_fetch(data.attr['UID'], ['RFC822', 'FLAGS', 'INTERNALDATE']).first
+
+			# Append the message to the destination folder, preserving flags and
+			# internal timestamp.
+			if(!opt["localonly"] and !dest_info[mid])
+				dd "Storing message on destination server #{mid}..."
+
+				tries = 0
+				begin
+					tries += 1
+					dest.append(folder.name, msg.attr['RFC822'], msg.attr['FLAGS'], msg.attr['INTERNALDATE'])
+					@synced += 1
+
+				rescue Net::IMAP::NoResponseError => ex
+					if tries < 3
+						dd "Error: #{ex.message}. Retrying..."
+						sleep 1 * tries
+						retry
+					else
+						@failures += 1
+						dd "Error: #{ex.message}. Tried and failed #{tries} times; giving up on this message."
+					end
+
+				rescue Net::IMAP::BadResponseError => exx
+					if tries < 3
+						dd "Error: #{exx.message}. Retrying..."
+						sleep 1 * tries
+						retry
+					else
+						@failures += 1
+						dd "Error: #{exx.message}. Tried and failed #{tries} times; giving up on this message."
+					end
+				end
+			end
+
+			# Write the mail file to disk
+			if(opt["local"])
+				ds "Writing #{mid} to local disk"
+				filename = "#{mid}.emlx";
+
+				if(!FileTest.exists?("#{outputdir}/#{folder.name}/#{filename}")) # check again in for the case where it's on the server and not saved locally
+					msg_data = msg.attr['RFC822'].gsub(/\r\n?/, "\n")
+					file = File.new("#{outputdir}/#{folder.name}/#{filename}", "wb");
+					file.write("#{msg_data.length}\n#{msg_data}");
+					file.close;
+				end
+			end
+		end # end: uid_fetch_block(source, uids, ['ENVELOPE']) do |data|
+	end # end: uids.length > 0
+end
+
+# Close the imap connections
+source.close
+if(!opt["localonly"])
+    begin 
+
+	    dest.close
+
+    rescue Net::IMAP::BadResponseError => excep
+        dd "Unable to close desination mailbox. Not sure why?"
+    end
+end
+
+puts "Finished. Message counts: #{@existing} untouched, #{@synced} transferred, #{@failures} failures."

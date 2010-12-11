@@ -1,0 +1,6 @@
+A ruby script for copying email between IMAP servers or saving it locally. It's a modified version of a script rgrove wrote: http://wonko.com/post/ruby_script_to_sync_email_from_any_imap_server_to_gmail  
+
+To get started try: 'ruby clone_imap -help'
+
+
+
